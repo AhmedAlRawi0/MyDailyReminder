@@ -193,4 +193,5 @@ def daily_verse():
 
 if __name__ == '__main__':
     # send_daily_hadith() # ! Testing
-    app.run(debug=True)
+    port = os.getenv("PORT", 8080)
+    app.run(debug=True, port=port)
