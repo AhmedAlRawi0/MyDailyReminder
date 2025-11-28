@@ -49,7 +49,7 @@ def send_daily_reminder():
     # Email HTML content template
     for to_email in subscribers:
         #unsubscribe_link = f"http://127.0.0.1:5000/unsubscribe?email={to_email}"
-        unsubscribe_link = f"https://mydailyhadith.onrender.com/unsubscribe?email={to_email}"
+        unsubscribe_link = f"https://mydailyreminder-production.up.railway.app/unsubscribe?email={to_email}"
 
         email_body = f"""
         <!DOCTYPE html>
