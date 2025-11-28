@@ -4,7 +4,7 @@ import axios from 'axios';
 //const API_BASE_URL = process.env.REACT_APP_API_BASE_URL_PROD;
 //const API_BASE_URL_VERSE = "http://127.0.0.1:5000";
 //const API_BASE_URL_VERSE = "https://mydailyverse.onrender.com"
-const API_BASE_URL_HADITH = "https://mydailyhadith.onrender.com"
+const API_BASE_URL_HADITH = "https://mydailyreminder-production.up.railway.app"
 
 /**
  * @param {*} language 
