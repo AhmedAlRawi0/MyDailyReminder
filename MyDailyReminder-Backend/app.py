@@ -68,15 +68,26 @@ def daily_hadeeth():
     language = request.args.get('Language', 'English')
 
     if today != last_updated: # First API call of the day
-        hadeeth_id = hadeeth_ids[current_index]
-        hadeeth_data, hadeeth_data_fr = fetch_hadeeth(hadeeth_id) 
+        attempts = 0
+        max_attempts = len(hadeeth_ids)
+        selected_index = current_index
+        hadeeth_data = None
+        hadeeth_data_fr = None
 
-        if not hadeeth_data and not hadeeth_data_fr:
+        while attempts < max_attempts:
+            hadeeth_id = hadeeth_ids[selected_index]
+            hadeeth_data, hadeeth_data_fr = fetch_hadeeth(hadeeth_id)
+
+            if hadeeth_data and hadeeth_data_fr:
+                break
+
+            selected_index = (selected_index + 1) % len(hadeeth_ids)
+            attempts += 1
+
+        if not hadeeth_data or not hadeeth_data_fr:
             return jsonify({"error": "Failed to fetch English & French hadeeth data."}), 500
-        elif not hadeeth_data_fr:
-            hadeeth_data_fr = hadeeth_data
 
-        next_index = (current_index + 1) % len(hadeeth_ids)
+        next_index = (selected_index + 1) % len(hadeeth_ids)
         update_current_hadith_state(next_index, hadeeth_data, hadeeth_data_fr)
 
         # Since we are preserving data in the localStorage in the frontend, we need to send the same data from the previous session based on the language selected.

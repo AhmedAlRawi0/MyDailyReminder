@@ -17,19 +17,24 @@ def fetch_hadeeth(hadeeth_id):
     response_en = requests.get(url_en)
     response_fr = requests.get(url_fr)
     response_ar = requests.get(url_ar)
-    response_en_data = response_en.json()
-    response_fr_data = response_fr.json()
-    if response_en.status_code == 200 and response_fr.status_code == 200 and response_ar.status_code == 200:
-        response_en_data["reference"] = response_ar.json().get("reference")
-        response_fr_data["reference"] = response_ar.json().get("reference")
-        return response_en_data, response_fr_data
-    elif response_en.status_code == 200 and response_ar.status_code == 200:
-        response_en_data["reference"] = response_ar.json().get("reference")
-        return response_en_data
-    elif response_fr.status_code == 200 and response_ar.status_code == 200:
-        response_fr_data["reference"] = response_ar.json().get("reference")
-        return response_fr_data
-    return None
+
+    def safe_json(response):
+        try:
+            return response.json()
+        except ValueError:
+            return None
+
+    response_en_data = safe_json(response_en) if response_en.status_code == 200 else None
+    response_fr_data = safe_json(response_fr) if response_fr.status_code == 200 else None
+    response_ar_data = safe_json(response_ar) if response_ar.status_code == 200 else None
+
+    if response_ar_data:
+        if response_en_data:
+            response_en_data["reference"] = response_ar_data.get("reference")
+        if response_fr_data:
+            response_fr_data["reference"] = response_ar_data.get("reference")
+
+    return response_en_data, response_fr_data
 
 # Function to send daily hadeeth to all subscribers
 def send_daily_reminder():
