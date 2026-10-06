@@ -1,208 +1,100 @@
+import logging
+import os
+from datetime import date as calendar_date, datetime, timezone
+
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
-from datetime import datetime
-from hadith_ids import get_ids_list
-import pytz
-from models.database import add_subscriber, remove_subscriber, get_current_hadith_state, update_current_hadith_state
-from models.hadeeth import fetch_hadeeth, send_daily_reminder
-import os
-import requests
-import json
-from dotenv import load_dotenv
-from pymongo import MongoClient
-from pymongo.server_api import ServerApi
+import pymongo
+
+from models.budget import Budget
+from models.campaigns import CampaignSender, TORONTO, STATES, campaign_date
+from models.daily_content import DailyContent
+from models.database import (
+    add_subscriber, remove_subscriber, hadeeth_collection, quraan_collection,
+    subscribers_db, subscribers_collection,
+)
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+logger = logging.getLogger(__name__)
+content = DailyContent(subscribers_db['daily_content'], hadeeth_collection, quraan_collection)
+sender = CampaignSender(subscribers_db, subscribers_collection, content)
 
-################################ MDH Section ######################################################
 
-# Hadeeth IDs list
-hadeeth_ids = get_ids_list()
-
-# Endpoint to subscribe to email notifications
 @app.route('/subscribe', methods=['POST'])
 def subscribe():
-    data = request.get_json()
+    data = request.get_json() or {}
     email = data.get('email')
-    if not email:
+    if not isinstance(email, str) or not email or '\r' in email or '\n' in email:
         return jsonify({'message': 'Invalid email.'}), 400
-    
-    # Add the email from the database
     response = add_subscriber(email)
-    return jsonify(response), 200 if "Successfully" in response["message"] else 400
+    return jsonify(response), 200 if 'Successfully' in response['message'] else 400
 
-# Endpoint to unsubscribe from email notifications
+
 @app.route('/unsubscribe', methods=['GET'])
 def unsubscribe():
     email = request.args.get('email')
     if not email:
         return jsonify({'message': 'Invalid email.'}), 400
-    
-    # Remove the email from the database
     response = remove_subscriber(email)
-    return jsonify(response), 200 if "Successfully" in response["message"] else 400
+    return jsonify(response), 200 if 'Successfully' in response['message'] else 400
 
-# Endpoint to send emails
+
 @app.route('/send-email', methods=['GET'])
 def sendEmail():
-    current_index, last_updated, last_updated_syd, last_hadeeth, last_hadeeth_fr = get_current_hadith_state()
+    budget = Budget()
+    try:
+        first_date = os.getenv('EMAIL_JOB_START_DATE', '')
+        if first_date and campaign_date(datetime.now(timezone.utc)) < calendar_date.fromisoformat(first_date).isoformat():
+            response = jsonify({'campaign_date': campaign_date(datetime.now(timezone.utc)),
+                                'status': 'not_due', 'counts': dict.fromkeys(STATES, 0),
+                                'total': 0, 'initialized': 0})
+            response.headers['Cache-Control'] = 'no-store'
+            return response, 200
+        with pymongo.timeout(budget.remaining()):
+            result = sender.run(budget)
+        response = jsonify(result)
+        response.headers['Cache-Control'] = 'no-store'
+        return response, 200
+    except Exception as exc:
+        # Never log exception messages: SMTP and DB errors can contain recipients or credentials.
+        logger.error('email_campaign infrastructure_failure type=%s', type(exc).__name__)
+        response = jsonify({'campaign_date': campaign_date(datetime.now(timezone.utc)),
+                            'status': 'infrastructure_failure', 'counts': None})
+        response.headers['Cache-Control'] = 'no-store'
+        return response, 503
 
-    local_syd_tz = pytz.timezone('Australia/Sydney')
-    today_syd = datetime.now(local_syd_tz).strftime("%Y-%m-%d")
 
-    if today_syd != last_updated_syd: # API call at 8am EST to send daily hadith
-       send_daily_reminder()
-       update_current_hadith_state(current_index, last_hadeeth, last_hadeeth_fr)
-       return jsonify({"message": "Email sent to subscribers"}), 200
-    else:
-        return jsonify({"message": "Email already sent today"}), 400
-
-# Endpoint to get the daily hadeeth
-@app.route('/daily-hadeeth', methods=['GET'])
-def daily_hadeeth():
-    current_index, last_updated, last_updated_syd, last_hadeeth, last_hadeeth_fr = get_current_hadith_state()
-        
-    local_tz = pytz.timezone('US/Eastern')
-    today = datetime.now(local_tz).strftime("%Y-%m-%d")
-    language = request.args.get('Language', 'English')
-
-    if today != last_updated: # First API call of the day
-        attempts = 0
-        max_attempts = len(hadeeth_ids)
-        selected_index = current_index
-        hadeeth_data = None
-        hadeeth_data_fr = None
-
-        while attempts < max_attempts:
-            hadeeth_id = hadeeth_ids[selected_index]
-            hadeeth_data, hadeeth_data_fr = fetch_hadeeth(hadeeth_id)
-
-            if hadeeth_data and hadeeth_data_fr:
-                break
-
-            selected_index = (selected_index + 1) % len(hadeeth_ids)
-            attempts += 1
-
-        if not hadeeth_data or not hadeeth_data_fr:
-            return jsonify({"error": "Failed to fetch English & French hadeeth data."}), 500
-
-        next_index = (selected_index + 1) % len(hadeeth_ids)
-        update_current_hadith_state(next_index, hadeeth_data, hadeeth_data_fr)
-
-        # Since we are preserving data in the localStorage in the frontend, we need to send the same data from the previous session based on the language selected.
-        response = make_response(jsonify(hadeeth_data_fr if language == 'French' else hadeeth_data)) 
-    else:
-        response = make_response(jsonify(last_hadeeth_fr if language == 'French' else last_hadeeth))
-    
+def daily_response(kind):
+    date = datetime.now(TORONTO).date().isoformat()
+    budget = Budget()
+    try:
+        with pymongo.timeout(budget.remaining()):
+            parts = content.prepare(kind, date, budget)
+        if not parts:
+            response = make_response(jsonify({'error': 'Daily content is being prepared. Please retry.'}), 503)
+            response.headers['Retry-After'] = '5'
+        else:
+            language = 'fr' if request.args.get('Language') == 'French' else 'en'
+            response = make_response(jsonify(parts[language]))
+    except Exception as exc:
+        logger.error('daily_content unavailable kind=%s type=%s', kind, type(exc).__name__)
+        response = make_response(jsonify({'error': 'Daily content is temporarily unavailable.'}), 503)
+        response.headers['Retry-After'] = '5'
     response.headers['Cache-Control'] = 'no-store'
     return response
-###################################################################################################
 
-################################ MDV Section ######################################################
-# Load quran.json
-with open("quran.json", "r") as f:
-    QURAN_DATA = json.load(f)
 
-load_dotenv()
+@app.route('/daily-hadeeth', methods=['GET'])
+def daily_hadeeth():
+    return daily_response('hadith')
 
-# MongoDB configuration
-MONGO_URI = os.getenv("MONGO_URI")
-DB_NAME = os.getenv("MONGO_QURAAN_DB_NAME")
-COLLECTION_NAME = "quraan-persistence"
 
-# Connect to MongoDB
-try:
-    client = MongoClient(MONGO_URI,
-                        tls=True,
-                        tlsAllowInvalidCertificates=True,
-                        server_api=ServerApi('1'))
-    client.admin.command('ping')
-    print("Connected to MongoDB Alhamdulilah!")
-    db = client[DB_NAME]
-    persistence_collection = db[COLLECTION_NAME]
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    exit()
-
-###############* Helper functions *###############
-def get_current_state():
-    doc = persistence_collection.find_one()
-    if not doc:
-        initial_state = {
-            "current_surah": 1,
-            "current_verse": 1,
-            "last_updated": "1970-01-01",
-            "last_verse": None,
-            "last_verse_fr": None,
-        }
-        persistence_collection.insert_one(initial_state)
-        return initial_state["current_surah"], initial_state["current_verse"], initial_state["last_updated"], initial_state["last_verse"], initial_state["last_verse_fr"]
-    return doc.get("current_surah", 1), doc.get("current_verse", 1), doc.get("last_updated", "1970-01-01"), doc.get("last_verse", None), doc.get("last_verse_fr", None)
-
-def update_current_state(surah, verse, verse_data, verse_data_fr):
-    """Update the current state in MongoDB."""
-    local_tz = pytz.timezone("US/Eastern")
-    last_updated = datetime.now(local_tz).strftime("%Y-%m-%d")
-
-    persistence_collection.update_one(
-        {},
-        {
-            "$set": {
-                "current_surah": surah,
-                "current_verse": verse,
-                "last_updated": last_updated,
-                "last_verse": verse_data,
-                "last_verse_fr": verse_data_fr,
-            }
-        },
-        upsert=True
-    )
-
-def fetch_verse(surah, verse, translation_key):
-    """Fetch verse data from the QuranEnc API."""
-    url = f"https://quranenc.com/api/v1/translation/aya/{translation_key}/{surah}/{verse}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        return response.json()
-    return None
-
-@app.route("/daily-verse", methods=["GET"])
+@app.route('/daily-verse', methods=['GET'])
 def daily_verse():
-    current_surah, current_verse, last_updated, last_verse, last_verse_fr = get_current_state()
+    return daily_response('verse')
 
-    # US/Eastern timezone logic for daily verse API
-    local_tz = pytz.timezone("US/Eastern")
-    today = datetime.now(local_tz).strftime("%Y-%m-%d")
-    language = request.args.get("Language", "english_rwwad")
-
-    if today != last_updated:
-        verse_data = fetch_verse(current_surah, current_verse, "english_rwwad")
-        verse_data_fr = fetch_verse(current_surah, current_verse, "french_montada")
-
-        if current_verse < QURAN_DATA[str(current_surah)]:
-            next_surah, next_verse = current_surah, current_verse + 1
-        else:  # Move to the next surah or loop back to the first surah
-            next_surah = current_surah + 1 if current_surah < 114 else 1
-            next_verse = 1
-
-        if not verse_data or not verse_data_fr:
-            return jsonify({"error": "Failed to fetch verse data."}), 500
-
-        update_current_state(next_surah, next_verse, verse_data, verse_data_fr)
-        response = make_response(
-            jsonify(verse_data_fr if language == "French" else verse_data)
-        )
-    else:
-        response = make_response(
-            jsonify(last_verse_fr if language == "French" else last_verse)
-        )
-
-    response.headers["Cache-Control"] = "no-store"
-    return response
-###########################################################################################
 
 if __name__ == '__main__':
-    # send_daily_hadith() # ! Testing
-    port = os.getenv("PORT", 8080)
-    app.run(debug=True, port=port)
+    app.run(port=int(os.getenv('PORT', '8080')))
